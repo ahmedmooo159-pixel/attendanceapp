@@ -1,21 +1,76 @@
 /**
  * Audio feedback generator using Web Audio API
  * No external MP3 files required - works 100% reliably offline.
+ * Unlocks AudioContext on first user gesture for iOS Safari compatibility.
+ * Guards navigator.vibrate and never blocks attendance flow.
  */
 class SoundEffects {
   constructor() {
     this.audioCtx = null;
+    this.isUnlocked = false;
+    this.setupGestureUnlock();
+  }
+
+  setupGestureUnlock() {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    const unlockEvents = ['click', 'touchstart', 'touchend', 'keydown'];
+    const unlockHandler = () => {
+      this.unlockAudio();
+      unlockEvents.forEach(evt => {
+        try {
+          document.removeEventListener(evt, unlockHandler);
+        } catch (e) {}
+      });
+    };
+
+    unlockEvents.forEach(evt => {
+      try {
+        document.addEventListener(evt, unlockHandler, { once: true, passive: true });
+      } catch (e) {
+        document.addEventListener(evt, unlockHandler);
+      }
+    });
+  }
+
+  unlockAudio() {
+    try {
+      this.initContext();
+      if (this.audioCtx && this.audioCtx.state === 'suspended') {
+        this.audioCtx.resume().then(() => {
+          this.isUnlocked = true;
+        }).catch(() => {});
+      } else if (this.audioCtx && this.audioCtx.state === 'running') {
+        this.isUnlocked = true;
+      }
+    } catch (e) {
+      // Never throw
+    }
   }
 
   initContext() {
-    if (!this.audioCtx) {
-      const AudioContext = window.AudioContext || window.webkitAudioContext;
-      if (AudioContext) {
-        this.audioCtx = new AudioContext();
+    try {
+      if (!this.audioCtx && typeof window !== 'undefined') {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (AudioContextClass) {
+          this.audioCtx = new AudioContextClass();
+        }
       }
+      if (this.audioCtx && this.audioCtx.state === 'suspended') {
+        this.audioCtx.resume().catch(() => {});
+      }
+    } catch (e) {
+      // Never throw or block
     }
-    if (this.audioCtx && this.audioCtx.state === 'suspended') {
-      this.audioCtx.resume();
+  }
+
+  safeVibrate(pattern) {
+    try {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        navigator.vibrate(pattern);
+      }
+    } catch (e) {
+      // Ignore vibration errors completely
     }
   }
 
@@ -23,7 +78,10 @@ class SoundEffects {
   playCheckInSuccess() {
     try {
       this.initContext();
-      if (!this.audioCtx) return;
+      if (!this.audioCtx) {
+        this.safeVibrate([100, 50, 100]);
+        return;
+      }
 
       const now = this.audioCtx.currentTime;
       
@@ -51,12 +109,10 @@ class SoundEffects {
       osc2.start(now + 0.12);
       osc2.stop(now + 0.65);
 
-      // Vibration on mobile phones
-      if (navigator.vibrate) {
-        navigator.vibrate([100, 50, 100]);
-      }
+      this.safeVibrate([100, 50, 100]);
     } catch (e) {
-      console.warn('Audio play error:', e);
+      // Never block attendance flow
+      console.warn('Audio play error (non-fatal):', e);
     }
   }
 
@@ -64,7 +120,10 @@ class SoundEffects {
   playCheckOutSuccess() {
     try {
       this.initContext();
-      if (!this.audioCtx) return;
+      if (!this.audioCtx) {
+        this.safeVibrate([150, 80, 250]);
+        return;
+      }
 
       const now = this.audioCtx.currentTime;
       const notes = [523.25, 659.25, 783.99, 1046.50]; // C Major arpeggio
@@ -83,11 +142,10 @@ class SoundEffects {
         osc.stop(startTime + 0.4);
       });
 
-      if (navigator.vibrate) {
-        navigator.vibrate([150, 80, 250]);
-      }
+      this.safeVibrate([150, 80, 250]);
     } catch (e) {
-      console.warn('Audio play error:', e);
+      // Never block attendance flow
+      console.warn('Audio play error (non-fatal):', e);
     }
   }
 
@@ -95,7 +153,10 @@ class SoundEffects {
   playError() {
     try {
       this.initContext();
-      if (!this.audioCtx) return;
+      if (!this.audioCtx) {
+        this.safeVibrate([300, 100, 300]);
+        return;
+      }
 
       const now = this.audioCtx.currentTime;
       const osc = this.audioCtx.createOscillator();
@@ -110,13 +171,19 @@ class SoundEffects {
       osc.start(now);
       osc.stop(now + 0.4);
 
-      if (navigator.vibrate) {
-        navigator.vibrate([300, 100, 300]);
-      }
+      this.safeVibrate([300, 100, 300]);
     } catch (e) {
-      console.warn('Audio play error:', e);
+      // Never block attendance flow
+      console.warn('Audio play error (non-fatal):', e);
     }
   }
 }
 
-window.soundEffects = new SoundEffects();
+if (typeof window !== 'undefined') {
+  window.SoundEffects = SoundEffects;
+  window.soundEffects = new SoundEffects();
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { SoundEffects };
+}

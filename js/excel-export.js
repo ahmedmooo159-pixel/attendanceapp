@@ -4,10 +4,25 @@
  * Developer: Eng. Ahmed Mourad
  */
 
+function sanitizeExcelCell(val) {
+  if (typeof val === 'string' && val.length > 0) {
+    const firstChar = val.charAt(0);
+    if (firstChar === '=' || firstChar === '+' || firstChar === '-' || firstChar === '@') {
+      return "'" + val;
+    }
+  }
+  return val;
+}
+
 class ExcelExporter {
   static exportFullReport(records, employees, options = {}) {
     if (typeof XLSX === 'undefined') {
       alert('مكتبة الإكسيل غير محملة، يرجى التحقق من اتصال الإنترنت.');
+      return;
+    }
+
+    if (!records || records.length === 0) {
+      alert('لا توجد سجلات مطابقة للتصدير في هذه الفترة.');
       return;
     }
 
@@ -16,7 +31,7 @@ class ExcelExporter {
     // 1. Prepare Summary Sheet Data (ملخص الموظفين)
     const summaryData = [];
     summaryData.push(['تقرير ملخص ساعات عمل الموظفين - مركز المستقبل للخدمات التعليمية']);
-    summaryData.push(['تاريخ استخراج التقرير:', new Date().toLocaleDateString('ar-EG', { dateStyle: 'full' })]);
+    summaryData.push(['تاريخ استخراج التقرير:', new Date().toLocaleDateString('ar-EG', { timeZone: 'Africa/Cairo', dateStyle: 'full' })]);
     summaryData.push([]); // Empty row
     summaryData.push([
       'كود الموظف',
@@ -42,13 +57,13 @@ class ExcelExporter {
       const avgMins = Math.floor((avgSeconds % 3600) / 60);
 
       summaryData.push([
-        emp.code || '---',
-        emp.name,
-        emp.jobTitle || 'موظف',
+        sanitizeExcelCell(emp.code || '---'),
+        sanitizeExcelCell(emp.name),
+        sanitizeExcelCell(emp.jobTitle || 'موظف'),
         totalDays,
-        `${totalHours} س و ${totalMinutes} د`,
+        sanitizeExcelCell(`${totalHours} س و ${totalMinutes} د`),
         parseFloat(decimalHours),
-        totalDays > 0 ? `${avgHours} س و ${avgMins} د` : '0'
+        sanitizeExcelCell(totalDays > 0 ? `${avgHours} س و ${avgMins} د` : '0')
       ]);
     });
 
@@ -71,7 +86,7 @@ class ExcelExporter {
     // 2. Prepare Detailed Daily Log Sheet (السجل التفصيلي اليومي)
     const detailData = [];
     detailData.push(['سجل الحضور والانصراف التفصيلي بالثانية - مركز المستقبل']);
-    detailData.push(['الفترة:', options.dateFilterLabel || 'الكل']);
+    detailData.push(['الفترة:', sanitizeExcelCell(options.dateFilterLabel || 'الكل')]);
     detailData.push([]); // Empty row
     detailData.push([
       'التاريخ',
@@ -87,12 +102,20 @@ class ExcelExporter {
     ]);
 
     // Sort records chronologically descending
-    const sortedRecords = [...records].sort((a, b) => new Date(b.date + ' ' + (b.checkInTimeRaw || '00:00:00')) - new Date(a.date + ' ' + (a.checkInTimeRaw || '00:00:00')));
+    const sortedRecords = [...records].sort((a, b) => new Date(b.checkInTimeRaw || b.date) - new Date(a.checkInTimeRaw || a.date));
 
     sortedRecords.forEach(r => {
       const emp = employees.find(e => e.id === r.empId) || { name: r.empName || 'غير معروف', code: '---' };
-      const d = new Date(r.date);
-      const dayName = isNaN(d.getTime()) ? '' : d.toLocaleDateString('ar-EG', { weekday: 'long' });
+      
+      // Parse YYYY-MM-DD manually to prevent UTC timezone shift
+      let dayName = '';
+      if (r.date) {
+        const parts = String(r.date).split('-').map(Number);
+        if (parts.length === 3 && !parts.some(isNaN)) {
+          const d = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2], 12, 0, 0));
+          dayName = d.toLocaleDateString('ar-EG', { timeZone: 'Africa/Cairo', weekday: 'long' });
+        }
+      }
       
       const totalSec = r.workSeconds || 0;
       const h = Math.floor(totalSec / 3600);
@@ -102,16 +125,16 @@ class ExcelExporter {
       const decimalHours = totalSec > 0 ? parseFloat((totalSec / 3600).toFixed(2)) : 0;
 
       detailData.push([
-        r.date,
-        dayName,
-        emp.code || '---',
-        emp.name,
-        r.checkInTimeFormatted || r.checkInTime || '---',
-        r.checkOutTimeFormatted || r.checkOutTime || 'لم ينصرف بعد',
-        formattedDuration,
+        sanitizeExcelCell(r.date),
+        sanitizeExcelCell(dayName),
+        sanitizeExcelCell(emp.code || '---'),
+        sanitizeExcelCell(emp.name),
+        sanitizeExcelCell(r.checkInTimeFormatted || r.checkInTime || '---'),
+        sanitizeExcelCell(r.checkOutTimeFormatted || r.checkOutTime || 'لم ينصرف بعد'),
+        sanitizeExcelCell(formattedDuration),
         decimalHours,
-        r.status || 'مكتمل',
-        r.notes || ''
+        sanitizeExcelCell(r.status || 'مكتمل'),
+        sanitizeExcelCell(r.notes || '')
       ]);
     });
 
@@ -133,7 +156,7 @@ class ExcelExporter {
     XLSX.utils.book_append_sheet(wb, wsDetail, 'السجل_التفصيلي_اليومي');
 
     // Generate filename
-    const nowStr = new Date().toISOString().slice(0, 10);
+    const nowStr = typeof cairoDate === 'function' ? cairoDate() : new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Cairo' });
     const fileName = `تقرير_حضور_وانصراف_مركز_المستقبل_${nowStr}.xlsx`;
 
     // Download file

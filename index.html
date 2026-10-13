@@ -45,6 +45,9 @@
         </a>
 
         <div class="nav-controls">
+          <button id="btn-install-app" class="nav-btn outline" onclick="app.promptInstallApp()" style="border-color: rgba(212,175,55,0.4); color: var(--gold-light);">
+            <i class="fas fa-download"></i> تثبيت على الهاتف
+          </button>
           <button class="nav-btn primary active" data-view="employee" onclick="app.switchView('employee')">
             <i class="fas fa-mobile-screen"></i> واجهة الموظف
           </button>
@@ -442,6 +445,9 @@
       <div id="scanner-container">
         <div id="qr-camera-reader" style="width: 100%;"></div>
       </div>
+      <p id="ios-camera-hint" style="color: var(--gold-light); font-size: 0.85rem; margin-top: 0.75rem; display: none; background: rgba(212,175,55,0.08); padding: 0.5rem 0.75rem; border-radius: var(--radius-sm); border: 1px solid rgba(212,175,55,0.2);">
+        <i class="fab fa-apple"></i> لمستخدمي آيفون (Safari): إذا لم تظهر الكاميرا، اضغط على زر إعدادات الموقع (aA) بجوار شريط العنوان ثم اختر "إعدادات موقع الويب" واسمح بالكاميرا.
+      </p>
       <div class="modal-actions" style="justify-content: center; margin-top: 1.25rem;">
         <button class="nav-btn outline" onclick="app.stopCameraScanner()">إغلاق الكاميرا</button>
       </div>
@@ -471,6 +477,10 @@
       <div class="form-group">
         <label for="emp-form-phone">رقم الهاتف الشخصي:</label>
         <input type="tel" id="emp-form-phone" class="form-control" placeholder="مثال: 01012345678" />
+      </div>
+      <div class="form-group" style="display: flex; align-items: center; gap: 0.6rem; margin-top: 1rem; background: rgba(255,255,255,0.03); padding: 0.75rem 1rem; border-radius: var(--radius-md); border: 1px solid var(--border-color);">
+        <input type="checkbox" id="emp-form-direct-btn" style="width: 1.25rem; height: 1.25rem; accent-color: var(--gold-primary); cursor: pointer;" />
+        <label for="emp-form-direct-btn" style="cursor: pointer; margin: 0; font-size: 0.95rem; font-weight: 600; color: #fff;">السماح بتسجيل الحضور والانصراف بالزرار مباشرة (بدون مسح الكود)</label>
       </div>
       <div class="modal-actions">
         <button class="nav-btn primary" onclick="app.saveEmployeeForm()">
@@ -520,10 +530,32 @@
     </div>
   </div>
 
+  <!-- 7. iOS Install Guide Modal -->
+  <div id="ios-install-modal" class="modal-backdrop">
+    <div class="modal-dialog" style="max-width: 460px; text-align: center;">
+      <div class="modal-header" style="justify-content: center;">
+        <h3><i class="fab fa-apple" style="color: var(--gold-primary);"></i> تثبيت التطبيق على الآيفون</h3>
+        <button class="btn-close-modal" onclick="app.closeModal('ios-install-modal')">&times;</button>
+      </div>
+      <div style="font-size: 3.5rem; margin-bottom: 0.75rem;">📲</div>
+      <p style="color: var(--text-secondary); margin-bottom: 1.25rem; font-size: 1rem; line-height: 1.8;">
+        لتثبيت تطبيق <b>مركز المستقبل</b> على الشاشة الرئيسية للآيفون:
+      </p>
+      <div style="background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1rem; text-align: right; margin-bottom: 1.5rem;">
+        <p style="margin-bottom: 0.5rem;">1️⃣ اضغط على زر <b>المشاركة (Share)</b> <i class="fas fa-arrow-up-from-bracket" style="color: var(--gold-light);"></i> في أسفل متصفح Safari.</p>
+        <p>2️⃣ انزل لأسفل واختر <b>«إضافة إلى الشاشة الرئيسية (Add to Home Screen) ➕»</b>.</p>
+      </div>
+      <button class="nav-btn primary" onclick="app.closeModal('ios-install-modal')" style="width: 100%; justify-content: center;">
+        فهمت ذلك
+      </button>
+    </div>
+  </div>
+
   <!-- Toast Notification Container -->
   <div id="toast-container" class="toast-container"></div>
 
   <!-- Application Scripts -->
+  <script src="js/time-utils.js"></script>
   <script src="js/audio.js"></script>
   <script src="js/excel-export.js"></script>
   <script src="js/firebase-config.js"></script>

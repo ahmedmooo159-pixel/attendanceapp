@@ -6,6 +6,120 @@
 
 const DEFAULT_ADMIN_PIN = '1234';
 const STATION_SECRET_TOKEN = 'MSTQ_HQ_OFFICE_2026';
+const REQUIRE_TOKEN = true;
+const MIN_SECONDS_BEFORE_CHECKOUT = 120;
+const MAX_SHIFT_HOURS = 12;
+const UNDO_WINDOW_SECONDS = 600;
+
+function esc(str) {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+window.esc = esc;
+
+function isManualRecord(record) {
+  if (!record) return false;
+  if (record.notes && (record.notes.includes('يدوي') || record.notes.toLowerCase().includes('manual'))) {
+    return true;
+  }
+  const standardPrefix = 'REC_' + record.empId + '_' + record.date;
+  if (record.id !== standardPrefix) {
+    return true;
+  }
+  return false;
+}
+window.isManualRecord = isManualRecord;
+
+function cairoDate(d = new Date()) {
+  const dateObj = typeof d === 'string' || typeof d === 'number' ? new Date(d) : d;
+  return dateObj.toLocaleDateString('en-CA', { timeZone: 'Africa/Cairo' });
+}
+window.cairoDate = cairoDate;
+
+function cairoOffsetMs(d = new Date()) {
+  if (typeof window !== 'undefined' && window.cairoOffsetMs) return window.cairoOffsetMs(d);
+  const dateObj = typeof d === 'string' || typeof d === 'number' ? new Date(d) : d;
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Africa/Cairo',
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  const p = dtf.formatToParts(dateObj).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+  const cairoUtcMs = Date.UTC(
+    parseInt(p.year, 10),
+    parseInt(p.month, 10) - 1,
+    parseInt(p.day, 10),
+    parseInt(p.hour, 10),
+    parseInt(p.minute, 10),
+    parseInt(p.second, 10)
+  );
+  return cairoUtcMs - dateObj.getTime();
+}
+window.cairoOffsetMs = cairoOffsetMs;
+
+function cairoTimeToDate(dateStr, timeStr) {
+  if (typeof window !== 'undefined' && window.cairoTimeToDate && window.cairoTimeToDate !== cairoTimeToDate) {
+    return window.cairoTimeToDate(dateStr, timeStr);
+  }
+  const [y, m, d] = String(dateStr).split('-').map(Number);
+  const parts = String(timeStr || '00:00:00').split(':');
+  const hh = parseInt(parts[0] || '0', 10);
+  const mm = parseInt(parts[1] || '0', 10);
+  const ss = parseInt(parts[2] || '0', 10);
+
+  const targetUtcMs = Date.UTC(y, m - 1, d, hh, mm, ss);
+  const guess1 = new Date(targetUtcMs);
+  const offset1 = cairoOffsetMs(guess1);
+  const guess2 = new Date(targetUtcMs - offset1);
+  const offset2 = cairoOffsetMs(guess2);
+  return new Date(targetUtcMs - offset2);
+}
+window.cairoTimeToDate = cairoTimeToDate;
+window.cairoDateTimeToUtc = cairoTimeToDate;
+
+function getCairoTimeInputVal(isoStr) {
+  if (!isoStr) return '';
+  const d = new Date(isoStr);
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Africa/Cairo',
+    hourCycle: 'h23',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+  const p = dtf.formatToParts(d).reduce((acc, part) => {
+    acc[part.type] = part.value;
+    return acc;
+  }, {});
+  return `${p.hour}:${p.minute}:${p.second}`;
+}
+window.getCairoTimeInputVal = getCairoTimeInputVal;
+
+function normalizeNameKey(str) {
+  if (!str) return '';
+  return String(str)
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .replace(/[أإآ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .toLowerCase();
+}
+window.normalizeNameKey = normalizeNameKey;
 
 class AttendanceApp {
   constructor() {
@@ -19,6 +133,7 @@ class AttendanceApp {
     this.html5QrCode = null;
     this.liveClockTimer = null;
     this.liveShiftTimer = null;
+    this.scanBusy = false;
 
     this.init();
   }
@@ -41,6 +156,22 @@ class AttendanceApp {
       localStorage.setItem('almustaqbal_device_token', token);
     }
     this.deviceToken = token;
+  }
+
+  generateNextEmployeeCode() {
+    let maxNum = 0;
+    this.employees.forEach(e => {
+      if (e && e.code) {
+        const match = String(e.code).trim().match(/^EMP-(\d+)$/i);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          if (!isNaN(num) && num > maxNum) {
+            maxNum = num;
+          }
+        }
+      }
+    });
+    return 'EMP-' + String(maxNum + 1).padStart(2, '0');
   }
 
   // Load employees & attendance records (starts empty)
@@ -93,18 +224,24 @@ class AttendanceApp {
 
   // Triggered when mobile scans the QR Code link (?action=scan&station=...)
   checkUrlParameters() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const station = urlParams.get('station');
+    try {
+      const urlParams = new URLSearchParams(window.location.search);
+      const station = urlParams.get('station');
+      const token = urlParams.get('token');
+      const isValid = station === 'almustaqbal_hq' && (token === STATION_SECRET_TOKEN || REQUIRE_TOKEN === false);
 
-    if (station && (station === 'almustaqbal_hq' || station === STATION_SECRET_TOKEN)) {
-      window.history.replaceState({}, document.title, window.location.pathname);
+      if (isValid) {
+        window.history.replaceState({}, document.title, window.location.pathname);
 
-      if (this.currentEmployee) {
-        this.processAttendanceScan(this.currentEmployee);
-      } else {
-        // First time scanning on this phone -> Prompt to enter Name & Register
-        this.openSelfRegisterModal(true); // true = auto check-in after registration
+        if (this.currentEmployee) {
+          this.processAttendanceScan(this.currentEmployee, 'qr');
+        } else {
+          // First time scanning on this phone -> Prompt to enter Name & Register
+          this.openSelfRegisterModal(true); // true = auto check-in after registration
+        }
       }
+    } catch (e) {
+      console.error('Error parsing URL parameters:', e);
     }
   }
 
@@ -113,12 +250,14 @@ class AttendanceApp {
     const updateClock = () => {
       const now = new Date();
       const timeStr = now.toLocaleTimeString('ar-EG', {
+        timeZone: 'Africa/Cairo',
         hour: '2-digit',
         minute: '2-digit',
         hour12: true
       });
       const secStr = String(now.getSeconds()).padStart(2, '0');
       const dateStr = now.toLocaleDateString('ar-EG', {
+        timeZone: 'Africa/Cairo',
         weekday: 'long',
         year: 'numeric',
         month: 'long',
@@ -141,8 +280,37 @@ class AttendanceApp {
   }
 
   getTodayRecord(empId) {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = cairoDate();
     return this.attendanceRecords.find(r => r.empId === empId && r.date === todayStr);
+  }
+
+  getActiveRecord(empId) {
+    const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+      ? window.cloudStore.getServerNow()
+      : new Date();
+    const todayStr = cairoDate(now);
+    const todayRec = this.attendanceRecords.find(r => r.empId === empId && r.date === todayStr);
+    if (todayRec) return todayRec;
+
+    const openRecords = this.attendanceRecords.filter(r =>
+      r.empId === empId &&
+      !r.checkOutTime &&
+      r.date !== todayStr
+    );
+
+    if (openRecords.length === 0) return null;
+
+    openRecords.sort((a, b) => new Date(b.checkInTimeRaw || b.date) - new Date(a.checkInTimeRaw || a.date));
+    const latestOpen = openRecords[0];
+
+    const checkInDate = new Date(latestOpen.checkInTimeRaw || latestOpen.date);
+    const diffHours = (now.getTime() - checkInDate.getTime()) / (1000 * 3600);
+
+    if (diffHours >= 0 && diffHours < MAX_SHIFT_HOURS) {
+      return latestOpen;
+    }
+
+    return null;
   }
 
   // =========================================================================
@@ -184,10 +352,10 @@ class AttendanceApp {
     const initials = this.currentEmployee.name.split(' ').map(n => n[0]).slice(0, 2).join('');
     profileContainer.innerHTML = `
       <div class="employee-profile-pill">
-        <div class="emp-avatar">${initials}</div>
+        <div class="emp-avatar">${esc(initials)}</div>
         <div class="emp-info">
-          <div class="emp-name">${this.currentEmployee.name}</div>
-          <div class="emp-job">${this.currentEmployee.jobTitle || 'موظف بمركز المستقبل'} - ${this.currentEmployee.code || ''}</div>
+          <div class="emp-name">${esc(this.currentEmployee.name)}</div>
+          <div class="emp-job">${esc(this.currentEmployee.jobTitle || 'موظف بمركز المستقبل')} - ${esc(this.currentEmployee.code || '')}</div>
         </div>
         <div class="emp-device-badge">
           <i class="fas fa-check-circle"></i> هاتفك مسجل ومربوط
@@ -195,29 +363,69 @@ class AttendanceApp {
       </div>
     `;
 
-    const todayRecord = this.getTodayRecord(this.currentEmployee.id);
+    const todayRecord = this.getActiveRecord(this.currentEmployee.id);
+
+    const isDirectAllowed = !!(this.currentEmployee && this.currentEmployee.allowDirectButton);
+
+    let undoButtonHtml = '';
+    if (todayRecord && todayRecord.empId === this.currentEmployee.id && !isManualRecord(todayRecord)) {
+      const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+        ? window.cloudStore.getServerNow()
+        : new Date();
+      if (todayRecord.checkOutTime) {
+        const outTime = new Date(todayRecord.checkOutTimeRaw || todayRecord.updatedAt || todayRecord.date).getTime();
+        const elapsedSec = Math.max(0, Math.floor((now.getTime() - outTime) / 1000));
+        if (elapsedSec <= UNDO_WINDOW_SECONDS) {
+          const remainingMin = Math.ceil((UNDO_WINDOW_SECONDS - elapsedSec) / 60);
+          undoButtonHtml = `
+            <button class="nav-btn outline" onclick="app.undoLastAttendanceAction()" style="width: 100%; justify-content: center; margin-top: 0.75rem; color: #f87171; border-color: rgba(248, 113, 113, 0.4); padding: 0.75rem; font-size: 0.95rem;">
+              <i class="fas fa-undo"></i> تراجع عن تسجيل الانصراف (${remainingMin} د متبقية)
+            </button>
+          `;
+        }
+      } else {
+        const inTime = new Date(todayRecord.checkInTimeRaw || todayRecord.createdAt || todayRecord.date).getTime();
+        const elapsedSec = Math.max(0, Math.floor((now.getTime() - inTime) / 1000));
+        if (elapsedSec <= UNDO_WINDOW_SECONDS) {
+          const remainingMin = Math.ceil((UNDO_WINDOW_SECONDS - elapsedSec) / 60);
+          undoButtonHtml = `
+            <button class="nav-btn outline" onclick="app.undoLastAttendanceAction()" style="width: 100%; justify-content: center; margin-top: 0.75rem; color: #f87171; border-color: rgba(248, 113, 113, 0.4); padding: 0.75rem; font-size: 0.95rem;">
+              <i class="fas fa-undo"></i> تراجع عن تسجيل الحضور (${remainingMin} د متبقية)
+            </button>
+          `;
+        }
+      }
+    }
 
     if (!todayRecord) {
       // 1st Scan available: Check-In
-      actionsContainer.innerHTML = `
+      actionsContainer.innerHTML = isDirectAllowed ? `
         <button class="btn-big-action check-in" onclick="app.triggerDirectScanAction()">
-          <i class="fas fa-sign-in-alt"></i> تسجيل الحضور الآن (Scan 1)
+          <i class="fas fa-sign-in-alt"></i> تسجيل الحضور الآن
         </button>
         <button class="btn-big-action scan-camera" onclick="app.openCameraScannerModal()" style="font-size: 1.05rem; padding: 0.85rem;">
           <i class="fas fa-camera"></i> مسح كود المقر بالكاميرا
+        </button>
+      ` : `
+        <button class="btn-big-action check-in" onclick="app.openCameraScannerModal()">
+          <i class="fas fa-qrcode"></i> تسجيل الحضور (مسح الكود)
         </button>
       `;
       if (todayStatusCard) todayStatusCard.style.display = 'none';
     } else if (todayRecord && !todayRecord.checkOutTime) {
       // 2nd Scan available: Check-Out
-      actionsContainer.innerHTML = `
+      actionsContainer.innerHTML = (isDirectAllowed ? `
         <button class="btn-big-action check-out" onclick="app.triggerDirectScanAction()">
-          <i class="fas fa-sign-out-alt"></i> تسجيل الانصراف الآن (Scan 2)
+          <i class="fas fa-sign-out-alt"></i> تسجيل الانصراف الآن
         </button>
         <button class="btn-big-action scan-camera" onclick="app.openCameraScannerModal()" style="font-size: 1.05rem; padding: 0.85rem;">
           <i class="fas fa-camera"></i> مسح كود المقر بالكاميرا
         </button>
-      `;
+      ` : `
+        <button class="btn-big-action check-out" onclick="app.openCameraScannerModal()">
+          <i class="fas fa-qrcode"></i> تسجيل الانصراف (مسح الكود)
+        </button>
+      `) + undoButtonHtml;
 
       if (todayStatusCard) {
         todayStatusCard.style.display = 'block';
@@ -229,7 +437,7 @@ class AttendanceApp {
           <div class="status-timeline">
             <div class="timeline-box active">
               <span class="label">وقت الحضور المسجل:</span>
-              <div class="time-value time-mono">${todayRecord.checkInTimeFormatted}</div>
+              <div class="time-value time-mono">${esc(todayRecord.checkInTimeFormatted || todayRecord.checkInTime || '')}</div>
             </div>
             <div class="timeline-box">
               <span class="label">وقت الانصراف:</span>
@@ -249,7 +457,7 @@ class AttendanceApp {
         <button class="btn-big-action completed" disabled>
           <i class="fas fa-check-double"></i> تم تسجيل الحضور والانصراف بالكامل اليوم
         </button>
-      `;
+      ` + undoButtonHtml;
 
       const sec = todayRecord.workSeconds || 0;
       const h = Math.floor(sec / 3600);
@@ -266,11 +474,11 @@ class AttendanceApp {
           <div class="status-timeline">
             <div class="timeline-box">
               <span class="label">وقت الحضور:</span>
-              <div class="time-value time-mono">${todayRecord.checkInTimeFormatted}</div>
+              <div class="time-value time-mono">${esc(todayRecord.checkInTimeFormatted || todayRecord.checkInTime || '')}</div>
             </div>
             <div class="timeline-box">
               <span class="label">وقت الانصراف:</span>
-              <div class="time-value time-mono">${todayRecord.checkOutTimeFormatted}</div>
+              <div class="time-value time-mono">${esc(todayRecord.checkOutTimeFormatted || todayRecord.checkOutTime || '')}</div>
             </div>
           </div>
           <div class="duration-banner" style="margin-top: 1rem;">
@@ -284,11 +492,18 @@ class AttendanceApp {
 
   startLiveShiftTimer(checkInIso) {
     if (this.liveShiftTimer) clearInterval(this.liveShiftTimer);
+    if (!checkInIso && this.currentEmployee) {
+      const active = this.getActiveRecord(this.currentEmployee.id);
+      if (active) checkInIso = active.checkInTimeRaw;
+    }
+    if (!checkInIso) return;
     const updateDuration = () => {
       const el = document.getElementById('live-shift-duration');
       if (!el) return;
       const start = new Date(checkInIso).getTime();
-      const now = new Date().getTime();
+      const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+        ? window.cloudStore.getServerNow().getTime()
+        : new Date().getTime();
       const diffSec = Math.max(0, Math.floor((now - start) / 1000));
       const h = Math.floor(diffSec / 3600);
       const m = Math.floor((diffSec % 3600) / 60);
@@ -310,7 +525,8 @@ class AttendanceApp {
 
   // Save new employee from their phone and link immediately
   async saveSelfRegistration() {
-    const name = document.getElementById('self-reg-name').value.trim();
+    const rawName = document.getElementById('self-reg-name').value;
+    const name = rawName.replace(/\s+/g, ' ').trim();
     const jobTitle = document.getElementById('self-reg-job').value.trim();
     const phone = document.getElementById('self-reg-phone').value.trim();
 
@@ -319,7 +535,62 @@ class AttendanceApp {
       return;
     }
 
-    const newCode = 'EMP-' + String(this.employees.length + 1).padStart(2, '0');
+    const nameKey = normalizeNameKey(name);
+    const sameNameEmployees = this.employees.filter(e => normalizeNameKey(e.name) === nameKey);
+    let existingSameName = null;
+    if (sameNameEmployees.length > 0) {
+      existingSameName = sameNameEmployees.find(e => !e.deviceToken)
+        || sameNameEmployees.find(e => e.deviceToken === this.deviceToken)
+        || sameNameEmployees[0];
+    }
+
+    if (existingSameName) {
+      if (existingSameName.deviceToken === this.deviceToken) {
+        // Already bound to this phone -> do not create duplicate, rebind in memory and proceed
+        this.currentEmployee = existingSameName;
+        localStorage.setItem('almustaqbal_bound_emp_id', existingSameName.id);
+        this.closeModal('self-register-modal');
+        this.renderEmployeeView();
+        this.renderAdminView();
+        await this.processAttendanceScan(existingSameName);
+        return;
+      }
+
+      if (!existingSameName.deviceToken) {
+        // Case A: Same name, empty deviceToken (e.g. added by admin)
+        if (!confirm(`هل أنت فعلاً (${existingSameName.name})؟ سيتم ربط هذا الهاتف بحسابه`)) {
+          return;
+        }
+        existingSameName.deviceToken = this.deviceToken;
+        if (jobTitle && !existingSameName.jobTitle) existingSameName.jobTitle = jobTitle;
+        if (phone && !existingSameName.phone) existingSameName.phone = phone;
+        existingSameName.reboundAt = new Date().toISOString();
+        this.currentEmployee = existingSameName;
+        localStorage.setItem('almustaqbal_bound_emp_id', existingSameName.id);
+
+        try {
+          await window.cloudStore.saveEmployee(existingSameName);
+          this.showToast(`مرحباً بك يا ${existingSameName.name}! تم ربط هاتفك بنجاح`, 'success');
+        } catch (err) {
+          this.showToast('تم التسجيل على هاتفك وسيتم الرفع عند توفر الإنترنت', 'warning');
+        }
+
+        this.closeModal('self-register-modal');
+        this.renderEmployeeView();
+        this.renderAdminView();
+
+        // Automatically register 1st scan Check-in!
+        await this.processAttendanceScan(existingSameName);
+        return;
+      } else {
+        // Case B: Already bound to another phone
+        this.showToast('هذا الاسم مسجل بالفعل على هاتف آخر، تواصل مع الإدارة لفك الربط', 'error');
+        return;
+      }
+    }
+
+    // Case C: New employee
+    const newCode = this.generateNextEmployeeCode();
     const newEmp = {
       id: 'emp_' + Date.now(),
       name: name,
@@ -333,91 +604,179 @@ class AttendanceApp {
     this.employees.push(newEmp);
     this.currentEmployee = newEmp;
     localStorage.setItem('almustaqbal_bound_emp_id', newEmp.id);
-    await window.cloudStore.saveEmployee(newEmp);
+    try {
+      await window.cloudStore.saveEmployee(newEmp);
+      this.showToast(`مرحباً بك يا ${name}! تم ربط هاتفك بنجاح`, 'success');
+    } catch (err) {
+      this.showToast('تم التسجيل على هاتفك وسيتم الرفع عند توفر الإنترنت', 'warning');
+    }
 
     this.closeModal('self-register-modal');
-    this.showToast(`مرحباً بك يا ${name}! تم ربط هاتفك بنجاح`, 'success');
+    this.renderEmployeeView();
+    this.renderAdminView();
 
     // Automatically register 1st scan Check-in!
-    await this.processAttendanceScan(newEmp);
+    await this.processAttendanceScan(newEmp, 'qr');
   }
 
   // Attendance Scan execution (Check-in or Check-out)
-  async processAttendanceScan(employee) {
-    if (!employee) {
-      this.openSelfRegisterModal(true);
-      return;
-    }
+  async processAttendanceScan(employee, method = 'qr') {
+    if (this.scanBusy) return;
+    this.scanBusy = true;
 
-    const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
-    const nowTimeStr = now.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-    const nowIso = now.toISOString();
+    const actionButtons = document.querySelectorAll('#employee-action-buttons button');
+    actionButtons.forEach(b => { b.disabled = true; });
 
-    let record = this.getTodayRecord(employee.id);
+    try {
+      if (!employee) {
+        this.openSelfRegisterModal(true);
+        return;
+      }
 
-    if (!record) {
-      // 1st Scan: CHECK-IN
-      record = {
-        id: 'REC_' + employee.id + '_' + todayStr,
-        empId: employee.id,
-        empName: employee.name,
-        date: todayStr,
-        checkInTime: nowTimeStr,
-        checkInTimeFormatted: nowTimeStr,
-        checkInTimeRaw: nowIso,
-        checkOutTime: null,
-        checkOutTimeFormatted: null,
-        checkOutTimeRaw: null,
-        workSeconds: 0,
-        status: 'حاضر',
-        deviceToken: this.deviceToken,
-        createdAt: nowIso
-      };
+      const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+        ? window.cloudStore.getServerNow()
+        : new Date();
+      const serverOffset = (window.cloudStore && typeof window.cloudStore.serverTimeOffset === 'number')
+        ? window.cloudStore.serverTimeOffset
+        : 0;
+      const hasSignificantSkew = Math.abs(serverOffset) > (2 * 60 * 1000);
 
-      await window.cloudStore.saveAttendanceRecord(record);
-      this.attendanceRecords.unshift(record);
+      const todayStr = cairoDate(now);
+      const nowTimeStr = now.toLocaleTimeString('ar-EG', { timeZone: 'Africa/Cairo', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+      const nowIso = now.toISOString();
 
-      if (window.soundEffects) window.soundEffects.playCheckInSuccess();
-      this.showToast(`أهلاً بك يا ${employee.name} 👋 تم تسجيل حضورك بنجاح في تمام ${nowTimeStr}`, 'success');
+      let record = this.getActiveRecord(employee.id);
+      const todayRecId = 'REC_' + employee.id + '_' + todayStr;
+
+      // Check server copy before creating check-in to avoid overwriting checkout or concurrent scan
+      if (!record && window.cloudStore && typeof window.cloudStore.fetchAttendanceRecord === 'function') {
+        const serverCopy = await window.cloudStore.fetchAttendanceRecord(todayRecId);
+        if (serverCopy) {
+          record = serverCopy;
+          const idx = this.attendanceRecords.findIndex(r => r.id === serverCopy.id);
+          if (idx >= 0) this.attendanceRecords[idx] = serverCopy;
+          else this.attendanceRecords.unshift(serverCopy);
+          localStorage.setItem('almustaqbal_attendance_records', JSON.stringify(this.attendanceRecords));
+        }
+      }
+
+      if (!record) {
+        // 1st Scan: CHECK-IN
+        record = {
+          id: todayRecId,
+          empId: employee.id,
+          empName: employee.name,
+          date: todayStr,
+          checkInTime: nowTimeStr,
+          checkInTimeFormatted: nowTimeStr,
+          checkInTimeRaw: nowIso,
+          checkOutTime: null,
+          checkOutTimeFormatted: null,
+          checkOutTimeRaw: null,
+          workSeconds: 0,
+          status: 'حاضر',
+          method: method === 'button' ? 'button' : 'qr',
+          deviceToken: this.deviceToken,
+          createdAt: nowIso
+        };
+        if (hasSignificantSkew) {
+          record.clockSkewMs = serverOffset;
+        }
+
+        let isSynced = false;
+        try {
+          const txResult = await window.cloudStore.createAttendanceRecordTransaction(record);
+          if (txResult && !txResult.committed && txResult.existingRecord) {
+            record = txResult.existingRecord;
+            const idx = this.attendanceRecords.findIndex(r => r.id === record.id);
+            if (idx >= 0) this.attendanceRecords[idx] = record;
+            else this.attendanceRecords.unshift(record);
+            localStorage.setItem('almustaqbal_attendance_records', JSON.stringify(this.attendanceRecords));
+            this.showToast('تم العثور على سجل سابق لليوم', 'info');
+            this.renderEmployeeView();
+            this.renderAdminView();
+            return;
+          }
+          isSynced = true;
+        } catch (txErr) {
+          isSynced = false;
+        }
+
+        const idx = this.attendanceRecords.findIndex(r => r.id === record.id);
+        if (idx >= 0) this.attendanceRecords[idx] = record;
+        else this.attendanceRecords.unshift(record);
+
+        if (window.soundEffects) window.soundEffects.playCheckInSuccess();
+        if (isSynced) {
+          this.showToast(`أهلاً بك يا ${employee.name} 👋 تم تسجيل حضورك بنجاح في تمام ${nowTimeStr}`, 'success');
+        } else {
+          this.showToast('تم التسجيل على هاتفك وسيتم الرفع عند توفر الإنترنت', 'warning');
+        }
+        this.renderEmployeeView();
+        this.renderAdminView();
+      } else if (record && !record.checkOutTime) {
+        // 2nd Scan: CHECK-OUT
+        const checkInDate = new Date(record.checkInTimeRaw);
+        const durationSeconds = Math.max(0, Math.floor((now.getTime() - checkInDate.getTime()) / 1000));
+        
+        if (durationSeconds < MIN_SECONDS_BEFORE_CHECKOUT) {
+          this.showToast('تم تسجيل حضورك منذ لحظات، انتظر قليلاً قبل الانصراف', 'warning');
+          return;
+        }
+
+        const hours = Math.floor(durationSeconds / 3600);
+        const mins = Math.floor((durationSeconds % 3600) / 60);
+        const secs = durationSeconds % 60;
+
+        record.checkOutTime = nowTimeStr;
+        record.checkOutTimeFormatted = nowTimeStr;
+        record.checkOutTimeRaw = nowIso;
+        record.workSeconds = durationSeconds;
+        record.status = 'مكتمل';
+        record.updatedAt = nowIso;
+        if (hasSignificantSkew) {
+          record.clockSkewMs = serverOffset;
+        }
+
+        let isSynced = false;
+        try {
+          await window.cloudStore.saveAttendanceRecord(record);
+          isSynced = true;
+        } catch (syncErr) {
+          isSynced = false;
+        }
+
+        const idx = this.attendanceRecords.findIndex(r => r.id === record.id);
+        if (idx >= 0) this.attendanceRecords[idx] = record;
+
+        if (window.soundEffects) window.soundEffects.playCheckOutSuccess();
+        if (isSynced) {
+          this.showToast(`مع السلامة يا ${employee.name}! تم تسجيل انصرافك بنجاح. مدة العمل: ${hours} س و ${mins} د و ${secs} ث`, 'success');
+        } else {
+          this.showToast('تم التسجيل على هاتفك وسيتم الرفع عند توفر الإنترنت', 'warning');
+        }
+        this.renderEmployeeView();
+        this.renderAdminView();
+      } else {
+        this.showToast(`لقد قمت بتسجيل الحضور والانصراف لهذا اليوم بالفعل`, 'warning');
+      }
+    } finally {
+      this.scanBusy = false;
       this.renderEmployeeView();
-      this.renderAdminView();
-    } else if (record && !record.checkOutTime) {
-      // 2nd Scan: CHECK-OUT
-      const checkInDate = new Date(record.checkInTimeRaw);
-      const durationSeconds = Math.max(0, Math.floor((now.getTime() - checkInDate.getTime()) / 1000));
-      
-      const hours = Math.floor(durationSeconds / 3600);
-      const mins = Math.floor((durationSeconds % 3600) / 60);
-      const secs = durationSeconds % 60;
-
-      record.checkOutTime = nowTimeStr;
-      record.checkOutTimeFormatted = nowTimeStr;
-      record.checkOutTimeRaw = nowIso;
-      record.workSeconds = durationSeconds;
-      record.status = 'مكتمل';
-      record.updatedAt = nowIso;
-
-      await window.cloudStore.saveAttendanceRecord(record);
-
-      const idx = this.attendanceRecords.findIndex(r => r.id === record.id);
-      if (idx >= 0) this.attendanceRecords[idx] = record;
-
-      if (window.soundEffects) window.soundEffects.playCheckOutSuccess();
-      this.showToast(`مع السلامة يا ${employee.name}! تم تسجيل انصرافك بنجاح. مدة العمل: ${hours} س و ${mins} د و ${secs} ث`, 'success');
-      this.renderEmployeeView();
-      this.renderAdminView();
-    } else {
-      this.showToast(`لقد قمت بتسجيل الحضور والانصراف لهذا اليوم بالفعل`, 'warning');
     }
   }
 
   triggerDirectScanAction() {
-    if (this.currentEmployee) {
-      this.processAttendanceScan(this.currentEmployee);
-    } else {
+    if (!this.currentEmployee) {
       this.openSelfRegisterModal(true);
+      return;
     }
+    // Safety check: if employee is not allowed direct button, open camera scanner, NEVER record
+    if (!this.currentEmployee.allowDirectButton) {
+      this.openCameraScannerModal();
+      return;
+    }
+    this.processAttendanceScan(this.currentEmployee, 'button');
   }
 
   // =========================================================================
@@ -502,11 +861,16 @@ class AttendanceApp {
       return;
     }
 
-    await window.cloudStore.saveAdminPin(newPinInput);
     this.adminPin = newPinInput;
-
     this.closeModal('change-pin-modal');
-    this.showToast('تم تغيير وحفظ رمز مرور الإدارة بنجاح!', 'success');
+    try {
+      await window.cloudStore.saveAdminPin(newPinInput);
+      this.showToast('تم تغيير وحفظ رمز مرور الإدارة بنجاح!', 'success');
+    } catch (err) {
+      this.showToast('تم تغيير رمز المرور محلياً وسيتم الحفظ عند توفر الإنترنت', 'warning');
+    } finally {
+      this.renderAdminView();
+    }
   }
 
   switchAdminTab(tabName) {
@@ -534,10 +898,13 @@ class AttendanceApp {
 
   // Calculate live statistics
   renderAdminStats() {
-    const todayStr = new Date().toISOString().slice(0, 10);
+    const todayStr = cairoDate();
     const todayRecords = this.attendanceRecords.filter(r => r.date === todayStr);
 
-    const presentNowCount = todayRecords.filter(r => r.status === 'حاضر' && !r.checkOutTime).length;
+    const presentNowCount = this.employees.filter(emp => {
+      const active = this.getActiveRecord(emp.id);
+      return active && !active.checkOutTime;
+    }).length;
     const completedTodayCount = todayRecords.filter(r => r.checkOutTime).length;
     const totalStaffCount = this.employees.length;
     const absentCount = Math.max(0, totalStaffCount - (presentNowCount + completedTodayCount));
@@ -568,10 +935,10 @@ class AttendanceApp {
     const selectedEmpId = empFilter ? empFilter.value : 'all';
 
     const now = new Date();
-    const todayStr = now.toISOString().slice(0, 10);
-    const yesterday = new Date(now);
-    yesterday.setDate(now.getDate() - 1);
-    const yesterdayStr = yesterday.toISOString().slice(0, 10);
+    const todayStr = cairoDate(now);
+    const [y, m, d] = todayStr.split('-').map(Number);
+    const yesterdayDate = new Date(Date.UTC(y, m - 1, d - 1, 12, 0, 0));
+    const yesterdayStr = cairoDate(yesterdayDate);
 
     return this.attendanceRecords.filter(r => {
       if (selectedEmpId !== 'all' && r.empId !== selectedEmpId) return false;
@@ -585,7 +952,7 @@ class AttendanceApp {
       }
 
       return true;
-    }).sort((a, b) => new Date(b.date + ' ' + (b.checkInTimeRaw || '00:00:00')) - new Date(a.date + ' ' + (a.checkInTimeRaw || '00:00:00')));
+    }).sort((a, b) => new Date(b.checkInTimeRaw || b.date) - new Date(a.checkInTimeRaw || a.date));
   }
 
   renderAttendanceTable() {
@@ -615,25 +982,39 @@ class AttendanceApp {
 
       let badgeHtml = '<span class="badge badge-info">مكتمل</span>';
       if (r.status === 'حاضر' && !r.checkOutTime) {
-        badgeHtml = '<span class="badge badge-success"><i class="fas fa-circle"></i> متواجد الآن</span>';
+        const checkInDate = new Date(r.checkInTimeRaw || r.date);
+        const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+          ? window.cloudStore.getServerNow()
+          : new Date();
+        const elapsedHours = (now.getTime() - checkInDate.getTime()) / (1000 * 3600);
+
+        if (elapsedHours >= MAX_SHIFT_HOURS) {
+          badgeHtml = '<span class="badge badge-warning" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4);"><i class="fas fa-exclamation-triangle"></i> نسي الانصراف</span>';
+        } else {
+          badgeHtml = '<span class="badge badge-success"><i class="fas fa-circle"></i> متواجد الآن</span>';
+        }
       }
 
       return `
         <tr>
-          <td style="font-weight: 700;">${r.date}</td>
-          <td style="font-weight: 800; font-size: 1.1rem; color: #fff;">${r.empName}</td>
-          <td class="time-mono" style="color: var(--gold-light); font-weight: 800;">${r.checkInTimeFormatted || r.checkInTime || '---'}</td>
+          <td style="font-weight: 700;">${esc(r.date)}</td>
+          <td style="font-weight: 800; font-size: 1.1rem; color: #fff;">
+            ${esc(r.empName)}
+            ${r.method === 'button' ? '<span class="badge" style="font-size: 0.75rem; margin-right: 0.35rem; background: rgba(212,175,55,0.18); color: var(--gold-light); border: 1px solid rgba(212,175,55,0.35);"><i class="fas fa-hand-pointer"></i> زرار</span>' : ''}
+            ${(r.undoCount > 0) ? '<span class="badge" style="font-size: 0.75rem; margin-right: 0.35rem; background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3);"><i class="fas fa-undo"></i> تراجع</span>' : ''}
+          </td>
+          <td class="time-mono" style="color: var(--gold-light); font-weight: 800;">${esc(r.checkInTimeFormatted || r.checkInTime || '---')}</td>
           <td class="time-mono" style="color: ${r.checkOutTime ? 'var(--text-primary)' : 'var(--text-muted)'}; font-weight: 800;">
-            ${r.checkOutTimeFormatted || r.checkOutTime || 'لم ينصرف بعد'}
+            ${esc(r.checkOutTimeFormatted || r.checkOutTime || 'لم ينصرف بعد')}
           </td>
           <td class="time-mono" style="font-weight: 800; color: #fff;">${formattedDuration}</td>
           <td>${badgeHtml}</td>
           <td>
             <div style="display: flex; gap: 0.4rem;">
-              <button class="btn-icon-action" title="تعديل السجل يدوياً" onclick="app.openEditRecordModal('${r.id}')">
+              <button class="btn-icon-action" title="تعديل السجل يدوياً" onclick="app.openEditRecordModal('${esc(r.id)}')">
                 <i class="fas fa-edit"></i>
               </button>
-              <button class="btn-icon-action delete" title="حذف السجل" onclick="app.deleteRecord('${r.id}')">
+              <button class="btn-icon-action delete" title="حذف السجل" onclick="app.deleteRecord('${esc(r.id)}')">
                 <i class="fas fa-trash-alt"></i>
               </button>
             </div>
@@ -673,13 +1054,20 @@ class AttendanceApp {
         <div class="emp-summary-card">
           <div class="emp-summary-header">
             <div>
-              <div style="font-size: 1.25rem; font-weight: 900; color: #fff;">${emp.name}</div>
-              <div style="font-size: 0.9rem; color: var(--gold-light);">${emp.jobTitle || 'موظف'} - ${emp.code || ''}</div>
+              <div style="font-size: 1.25rem; font-weight: 900; color: #fff;">${esc(emp.name)}</div>
+              <div style="font-size: 0.9rem; color: var(--gold-light);">${esc(emp.jobTitle || 'موظف')} - ${esc(emp.code || '')}</div>
             </div>
-            <span class="badge ${isBound ? 'badge-success' : 'badge-warning'}">
-              <i class="fas ${isBound ? 'fa-mobile-alt' : 'fa-exclamation-triangle'}"></i>
-              ${isBound ? 'هاتف مربوط' : 'غير مربوط'}
-            </span>
+            <div style="display: flex; gap: 0.35rem; flex-wrap: wrap; justify-content: flex-end;">
+              ${emp.allowDirectButton ? `
+                <span class="badge" style="background: rgba(212,175,55,0.18); color: var(--gold-light); border: 1px solid rgba(212,175,55,0.35);">
+                  <i class="fas fa-hand-pointer"></i> زرار مباشر
+                </span>
+              ` : ''}
+              <span class="badge ${isBound ? 'badge-success' : 'badge-warning'}">
+                <i class="fas ${isBound ? 'fa-mobile-alt' : 'fa-exclamation-triangle'}"></i>
+                ${isBound ? 'هاتف مربوط' : 'غير مربوط'}
+              </span>
+            </div>
           </div>
 
           <div class="emp-metrics-row">
@@ -695,14 +1083,14 @@ class AttendanceApp {
 
           <div style="display: flex; gap: 0.5rem; justify-content: flex-end; margin-top: 1rem; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 0.85rem;">
             ${isBound ? `
-              <button class="nav-btn outline" style="padding: 0.4rem 0.85rem; font-size: 0.9rem;" onclick="app.unbindEmployeeDevice('${emp.id}')" title="فك ربط الهاتف ليتمكن من ربط هاتف جديد">
+              <button class="nav-btn outline" style="padding: 0.4rem 0.85rem; font-size: 0.9rem;" onclick="app.unbindEmployeeDevice('${esc(emp.id)}')" title="فك ربط الهاتف ليتمكن من ربط هاتف جديد">
                 <i class="fas fa-unlink"></i> فك ربط الهاتف
               </button>
             ` : ''}
-            <button class="nav-btn outline" style="padding: 0.4rem 0.85rem; font-size: 0.9rem;" onclick="app.openEditEmployeeModal('${emp.id}')">
+            <button class="nav-btn outline" style="padding: 0.4rem 0.85rem; font-size: 0.9rem;" onclick="app.openEditEmployeeModal('${esc(emp.id)}')">
               <i class="fas fa-user-edit"></i> تعديل
             </button>
-            <button class="btn-icon-action delete" style="width: 34px; height: 34px;" onclick="app.deleteEmployee('${emp.id}')">
+            <button class="btn-icon-action delete" style="width: 34px; height: 34px;" onclick="app.deleteEmployee('${esc(emp.id)}')">
               <i class="fas fa-trash"></i>
             </button>
           </div>
@@ -716,7 +1104,7 @@ class AttendanceApp {
     if (!filterSelect) return;
     const currentVal = filterSelect.value;
     filterSelect.innerHTML = '<option value="all">جميع الموظفين</option>' +
-      this.employees.map(e => `<option value="${e.id}" ${e.id === currentVal ? 'selected' : ''}>${e.name}</option>`).join('');
+      this.employees.map(e => `<option value="${esc(e.id)}" ${e.id === currentVal ? 'selected' : ''}>${esc(e.name)}</option>`).join('');
   }
 
   exportExcelReport() {
@@ -725,7 +1113,7 @@ class AttendanceApp {
     const dateLabel = dateFilter ? dateFilter.options[dateFilter.selectedIndex].text : 'الكل';
 
     if (window.ExcelExporter) {
-      window.ExcelExporter.exportFullReport(this.attendanceRecords, this.employees, {
+      window.ExcelExporter.exportFullReport(filtered, this.employees, {
         dateFilterLabel: dateLabel
       });
       this.showToast('تم تصدير ملف الإكسيل بنجاح!', 'success');
@@ -768,7 +1156,34 @@ class AttendanceApp {
     }, 300);
   }
 
+  getCameraErrorMessage(err) {
+    const isIOS = typeof navigator !== 'undefined' && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+    const iosNote = isIOS ? ' (لمستخدمي Safari: تأكد من تفعيل إذن الكاميرا من إعدادات الموقع aA)' : '';
+
+    if (typeof window !== 'undefined' && !window.isSecureContext && location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      return 'يتطلب تشغيل الكاميرا اتصالاً آمناً (HTTPS). يرجى فتح الموقع عبر رابط آمن' + iosNote;
+    }
+
+    const errStr = (err && (err.name || err.message || String(err))) || '';
+    if (errStr.includes('NotAllowedError') || errStr.includes('PermissionDeniedError') || errStr.toLowerCase().includes('permission')) {
+      return 'تم رفض إذن الوصول للكاميرا. يرجى السماح بالوصول للكاميرا في إعدادات المتصفح' + iosNote;
+    }
+    if (errStr.includes('NotFoundError') || errStr.includes('DevicesNotFoundError') || errStr.toLowerCase().includes('not found') || errStr.toLowerCase().includes('no camera')) {
+      return 'لم يتم العثور على كاميرا في هذا الجهاز' + iosNote;
+    }
+    if (errStr.includes('NotReadableError') || errStr.includes('TrackStartError')) {
+      return 'الكاميرا قيد الاستخدام بواسطة تطبيق آخر أو غير متاحة حالياً' + iosNote;
+    }
+
+    return 'تعذر تشغيل الكاميرا، يرجى التأكد من إعطاء الإذن وإعادة المحاولة' + iosNote;
+  }
+
   startCameraScanner() {
+    if (typeof window !== 'undefined' && !window.isSecureContext && location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      this.showToast(this.getCameraErrorMessage(new Error('InsecureContext')), 'error');
+      return;
+    }
+
     if (typeof Html5Qrcode === 'undefined') {
       this.showToast('مكتبة قارئ الكاميرا غير محملة', 'error');
       return;
@@ -778,7 +1193,19 @@ class AttendanceApp {
     if (!scannerEl) return;
 
     if (this.html5QrCode) {
-      try { this.html5QrCode.stop(); } catch (e) {}
+      try {
+        if (this.html5QrCode.isScanning) {
+          this.html5QrCode.stop().catch(() => {});
+        }
+        this.html5QrCode.clear();
+      } catch (e) {}
+      this.html5QrCode = null;
+    }
+
+    const isIOS = typeof navigator !== 'undefined' && (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1));
+    const iosHint = document.getElementById('ios-camera-hint');
+    if (iosHint) {
+      iosHint.style.display = isIOS ? 'block' : 'none';
     }
 
     this.html5QrCode = new Html5Qrcode('qr-camera-reader');
@@ -788,32 +1215,75 @@ class AttendanceApp {
       { facingMode: 'environment' },
       config,
       (decodedText) => {
-        this.html5QrCode.stop().then(() => {
+        const scanner = this.html5QrCode;
+        if (scanner && scanner.isScanning) {
+          scanner.stop().then(() => {
+            try { scanner.clear(); } catch (e) {}
+            this.html5QrCode = null;
+            this.closeModal('camera-scanner-modal');
+            this.handleScannedQrResult(decodedText);
+          }).catch(() => {
+            try { scanner.clear(); } catch (e) {}
+            this.html5QrCode = null;
+            this.closeModal('camera-scanner-modal');
+            this.handleScannedQrResult(decodedText);
+          });
+        } else {
           this.closeModal('camera-scanner-modal');
           this.handleScannedQrResult(decodedText);
-        }).catch(() => {
-          this.closeModal('camera-scanner-modal');
-          this.handleScannedQrResult(decodedText);
-        });
+        }
       },
       (error) => {}
     ).catch(err => {
       console.warn('Camera start error:', err);
-      this.showToast('تعذر تشغيل الكاميرا، يرجى السماح بالوصول للكاميرا في المتصفح', 'error');
+      const errorMsg = this.getCameraErrorMessage(err);
+      this.showToast(errorMsg, 'error');
     });
   }
 
-  stopCameraScanner() {
+  async stopCameraScanner() {
     if (this.html5QrCode) {
-      this.html5QrCode.stop().catch(err => console.warn(err));
+      const scanner = this.html5QrCode;
+      this.html5QrCode = null;
+      try {
+        if (scanner.isScanning) {
+          await scanner.stop();
+        }
+      } catch (err) {
+        console.warn('Error stopping scanner:', err);
+      }
+      try {
+        scanner.clear();
+      } catch (err) {
+        console.warn('Error clearing scanner:', err);
+      }
     }
+    const scannerEl = document.getElementById('qr-camera-reader');
+    if (scannerEl) scannerEl.innerHTML = '';
     this.closeModal('camera-scanner-modal');
   }
 
   handleScannedQrResult(decodedText) {
-    if (decodedText.includes('station=almustaqbal_hq') || decodedText.includes(STATION_SECRET_TOKEN)) {
+    let isValid = false;
+    try {
+      let searchParams;
+      if (typeof decodedText === 'string' && (decodedText.startsWith('http://') || decodedText.startsWith('https://'))) {
+        searchParams = new URL(decodedText).searchParams;
+      } else {
+        const qIdx = typeof decodedText === 'string' ? decodedText.indexOf('?') : -1;
+        const queryStr = qIdx !== -1 ? decodedText.slice(qIdx) : (decodedText || '');
+        searchParams = new URLSearchParams(queryStr);
+      }
+      const station = searchParams.get('station');
+      const token = searchParams.get('token');
+      isValid = station === 'almustaqbal_hq' && (token === STATION_SECRET_TOKEN || REQUIRE_TOKEN === false);
+    } catch (e) {
+      isValid = false;
+    }
+
+    if (isValid) {
       if (this.currentEmployee) {
-        this.processAttendanceScan(this.currentEmployee);
+        this.processAttendanceScan(this.currentEmployee, 'qr');
       } else {
         this.openSelfRegisterModal(true);
       }
@@ -828,9 +1298,11 @@ class AttendanceApp {
     document.getElementById('emp-modal-title').textContent = 'إضافة موظف جديد';
     document.getElementById('emp-form-id').value = '';
     document.getElementById('emp-form-name').value = '';
-    document.getElementById('emp-form-code').value = 'EMP-' + String(this.employees.length + 1).padStart(2, '0');
+    document.getElementById('emp-form-code').value = this.generateNextEmployeeCode();
     document.getElementById('emp-form-job').value = '';
     document.getElementById('emp-form-phone').value = '';
+    const directChk = document.getElementById('emp-form-direct-btn');
+    if (directChk) directChk.checked = false;
     this.openModal('employee-form-modal');
   }
 
@@ -844,6 +1316,8 @@ class AttendanceApp {
     document.getElementById('emp-form-code').value = emp.code || '';
     document.getElementById('emp-form-job').value = emp.jobTitle || '';
     document.getElementById('emp-form-phone').value = emp.phone || '';
+    const directChk = document.getElementById('emp-form-direct-btn');
+    if (directChk) directChk.checked = !!emp.allowDirectButton;
     this.openModal('employee-form-modal');
   }
 
@@ -859,6 +1333,8 @@ class AttendanceApp {
       return;
     }
 
+    const allowDirectButton = !!(document.getElementById('emp-form-direct-btn')?.checked);
+
     let emp;
     if (id) {
       emp = this.employees.find(e => e.id === id);
@@ -867,23 +1343,34 @@ class AttendanceApp {
         emp.code = code;
         emp.jobTitle = jobTitle;
         emp.phone = phone;
+        emp.allowDirectButton = allowDirectButton;
       }
     } else {
       emp = {
         id: 'emp_' + Date.now(),
         name,
-        code: code || ('EMP-' + String(this.employees.length + 1).padStart(2, '0')),
+        code: code || this.generateNextEmployeeCode(),
         jobTitle: jobTitle || 'موظف',
         phone,
         deviceToken: null,
+        allowDirectButton,
         createdAt: new Date().toISOString()
       };
       this.employees.push(emp);
     }
 
-    await window.cloudStore.saveEmployee(emp);
+    if (this.currentEmployee && this.currentEmployee.id === emp.id) {
+      this.currentEmployee.allowDirectButton = allowDirectButton;
+      this.renderEmployeeView();
+    }
+
+    try {
+      await window.cloudStore.saveEmployee(emp);
+      this.showToast('تم حفظ بيانات الموظف بنجاح', 'success');
+    } catch (err) {
+      this.showToast('تم الحفظ محلياً وسيتم الرفع عند توفر الإنترنت', 'warning');
+    }
     this.closeModal('employee-form-modal');
-    this.showToast('تم حفظ بيانات الموظف بنجاح', 'success');
     this.renderEmployeesGrid();
     this.populateEmployeeFilters();
   }
@@ -893,16 +1380,19 @@ class AttendanceApp {
     const emp = this.employees.find(e => e.id === empId);
     if (emp) {
       emp.deviceToken = null;
-      await window.cloudStore.saveEmployee(emp);
-
       if (this.currentEmployee && this.currentEmployee.id === empId) {
         localStorage.removeItem('almustaqbal_bound_emp_id');
         this.currentEmployee = null;
       }
-
-      this.showToast(`تم فك ربط الهاتف عن الموظف (${emp.name})`, 'info');
-      this.renderEmployeeView();
-      this.renderAdminView();
+      try {
+        await window.cloudStore.saveEmployee(emp);
+        this.showToast(`تم فك ربط الهاتف عن الموظف (${emp.name})`, 'info');
+      } catch (err) {
+        this.showToast('تم فك ربط الهاتف محلياً وسيتم المزامنة عند توفر الإنترنت', 'warning');
+      } finally {
+        this.renderEmployeeView();
+        this.renderAdminView();
+      }
     }
   }
 
@@ -912,11 +1402,15 @@ class AttendanceApp {
     if (!confirm(`هل أنت متأكد من حذف الموظف (${emp.name}) نهائياً؟`)) return;
 
     this.employees = this.employees.filter(e => e.id !== empId);
-    await window.cloudStore.deleteEmployee(empId);
-
-    this.showToast('تم حذف الموظف بنجاح', 'success');
-    this.renderEmployeesGrid();
-    this.populateEmployeeFilters();
+    try {
+      await window.cloudStore.deleteEmployee(empId);
+      this.showToast('تم حذف الموظف بنجاح', 'success');
+    } catch (err) {
+      this.showToast('تم حذف الموظف محلياً وسيتم المزامنة عند توفر الإنترنت', 'warning');
+    } finally {
+      this.renderEmployeesGrid();
+      this.populateEmployeeFilters();
+    }
   }
 
   // Manual Attendance Record
@@ -928,9 +1422,9 @@ class AttendanceApp {
 
     document.getElementById('manual-rec-id').value = '';
     const empSelect = document.getElementById('manual-rec-emp');
-    empSelect.innerHTML = this.employees.map(e => `<option value="${e.id}">${e.name}</option>`).join('');
+    empSelect.innerHTML = this.employees.map(e => `<option value="${esc(e.id)}">${esc(e.name)}</option>`).join('');
 
-    document.getElementById('manual-rec-date').value = new Date().toISOString().slice(0, 10);
+    document.getElementById('manual-rec-date').value = cairoDate();
     document.getElementById('manual-rec-checkin').value = '09:00:00';
     document.getElementById('manual-rec-checkout').value = '17:00:00';
     document.getElementById('manual-rec-notes').value = 'تسجيل يدوي بواسطة الإدارة';
@@ -944,17 +1438,17 @@ class AttendanceApp {
 
     document.getElementById('manual-rec-id').value = rec.id;
     const empSelect = document.getElementById('manual-rec-emp');
-    empSelect.innerHTML = this.employees.map(e => `<option value="${e.id}" ${e.id === rec.empId ? 'selected' : ''}>${e.name}</option>`).join('');
+    empSelect.innerHTML = this.employees.map(e => `<option value="${esc(e.id)}" ${e.id === rec.empId ? 'selected' : ''}>${esc(e.name)}</option>`).join('');
 
     document.getElementById('manual-rec-date').value = rec.date;
     
     let inTime = '09:00:00';
     if (rec.checkInTimeRaw) {
-      inTime = new Date(rec.checkInTimeRaw).toTimeString().slice(0, 8);
+      inTime = getCairoTimeInputVal(rec.checkInTimeRaw);
     }
     let outTime = '';
     if (rec.checkOutTimeRaw) {
-      outTime = new Date(rec.checkOutTimeRaw).toTimeString().slice(0, 8);
+      outTime = getCairoTimeInputVal(rec.checkOutTimeRaw);
     }
 
     document.getElementById('manual-rec-checkin').value = inTime;
@@ -978,8 +1472,27 @@ class AttendanceApp {
       return;
     }
 
-    const checkInDateTime = new Date(`${dateStr}T${checkInVal}`);
-    const checkInFormatted = checkInDateTime.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+    let existingRec = null;
+    if (id) {
+      existingRec = this.attendanceRecords.find(r => r.id === id);
+    } else {
+      const existingForDay = this.attendanceRecords.find(r => r.empId === empId && r.date === dateStr);
+      if (existingForDay) {
+        if (!confirm(`يوجد بالفعل سجل حضور للموظف (${emp.name}) في تاريخ (${dateStr}).\nهل تريد تعديل هذا السجل بدلاً من إنشاء سجل مكرر؟`)) {
+          return;
+        }
+        existingRec = existingForDay;
+      }
+    }
+
+    const checkInDateTime = cairoTimeToDate(dateStr, checkInVal);
+    const checkInFormatted = checkInDateTime.toLocaleTimeString('ar-EG', {
+      timeZone: 'Africa/Cairo',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: true
+    });
 
     let checkOutDateTime = null;
     let checkOutFormatted = null;
@@ -987,30 +1500,54 @@ class AttendanceApp {
     let status = 'حاضر';
 
     if (checkOutVal) {
-      checkOutDateTime = new Date(`${dateStr}T${checkOutVal}`);
-      checkOutFormatted = checkOutDateTime.toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+      checkOutDateTime = cairoTimeToDate(dateStr, checkOutVal);
+      // Overnight manual shift: if checkout <= checkin, checkout occurred the next day
+      if (checkOutDateTime.getTime() <= checkInDateTime.getTime()) {
+        const [y, m, d] = dateStr.split('-').map(Number);
+        const nextDayUtc = new Date(Date.UTC(y, m - 1, d + 1, 12, 0, 0));
+        const nextDayStr = cairoDate(nextDayUtc);
+        checkOutDateTime = cairoTimeToDate(nextDayStr, checkOutVal);
+      }
+      checkOutFormatted = checkOutDateTime.toLocaleTimeString('ar-EG', {
+        timeZone: 'Africa/Cairo',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+      });
       durationSeconds = Math.max(0, Math.floor((checkOutDateTime.getTime() - checkInDateTime.getTime()) / 1000));
       status = 'مكتمل';
     }
 
-    const rec = {
-      id: id || ('REC_' + emp.id + '_' + dateStr + '_' + Date.now().toString(36)),
+    // Merge into existing record if found, preserving deviceToken, createdAt, clockSkewMs and unknown fields
+    const rec = existingRec ? { ...existingRec } : {
+      id: 'REC_' + emp.id + '_' + dateStr,
       empId: emp.id,
       empName: emp.name,
-      date: dateStr,
-      checkInTime: checkInFormatted,
-      checkInTimeFormatted: checkInFormatted,
-      checkInTimeRaw: checkInDateTime.toISOString(),
-      checkOutTime: checkOutFormatted,
-      checkOutTimeFormatted: checkOutFormatted,
-      checkOutTimeRaw: checkOutDateTime ? checkOutDateTime.toISOString() : null,
-      workSeconds: durationSeconds,
-      status: status,
-      notes: notes || 'سجل يدوي معدل',
-      updatedAt: new Date().toISOString()
+      deviceToken: null,
+      createdAt: new Date().toISOString()
     };
 
-    await window.cloudStore.saveAttendanceRecord(rec);
+    rec.empName = emp.name;
+    rec.date = dateStr;
+    rec.checkInTime = checkInFormatted;
+    rec.checkInTimeFormatted = checkInFormatted;
+    rec.checkInTimeRaw = checkInDateTime.toISOString();
+    rec.checkOutTime = checkOutFormatted;
+    rec.checkOutTimeFormatted = checkOutFormatted;
+    rec.checkOutTimeRaw = checkOutDateTime ? checkOutDateTime.toISOString() : null;
+    rec.workSeconds = durationSeconds;
+    rec.status = status;
+    rec.notes = notes || 'سجل يدوي معدل';
+    rec.updatedAt = new Date().toISOString();
+
+    let isSynced = false;
+    try {
+      await window.cloudStore.saveAttendanceRecord(rec);
+      isSynced = true;
+    } catch (err) {
+      isSynced = false;
+    }
 
     const idx = this.attendanceRecords.findIndex(r => r.id === rec.id);
     if (idx >= 0) {
@@ -1020,21 +1557,107 @@ class AttendanceApp {
     }
 
     this.closeModal('manual-record-modal');
-    this.showToast('تم حفظ سجل الحضور بنجاح!', 'success');
+    if (isSynced) {
+      this.showToast('تم حفظ سجل الحضور بنجاح!', 'success');
+    } else {
+      this.showToast('تم الحفظ محلياً وسيتم الرفع عند توفر الإنترنت', 'warning');
+    }
     this.renderAttendanceTable();
     this.renderAdminStats();
     this.renderEmployeesGrid();
   }
 
+  async undoLastAttendanceAction() {
+    if (this.scanBusy) return;
+    this.scanBusy = true;
+
+    const actionButtons = document.querySelectorAll('#employee-action-buttons button');
+    actionButtons.forEach(b => { b.disabled = true; });
+
+    try {
+      if (!this.currentEmployee) return;
+      const record = this.getActiveRecord(this.currentEmployee.id);
+      if (!record || record.empId !== this.currentEmployee.id) {
+        this.showToast('لا يوجد سجل حضور أو انصراف نشط للتراجع عنه', 'warning');
+        return;
+      }
+
+      if (isManualRecord(record)) {
+        this.showToast('لا يمكن التراجع عن السجلات اليدوية المضافة من الإدارة', 'warning');
+        return;
+      }
+
+      const now = (window.cloudStore && typeof window.cloudStore.getServerNow === 'function')
+        ? window.cloudStore.getServerNow()
+        : new Date();
+
+      if (record.checkOutTime) {
+        // Undo Check-out: revert checkout fields within UNDO_WINDOW_SECONDS
+        const outTime = new Date(record.checkOutTimeRaw || record.updatedAt || record.date).getTime();
+        const elapsedSec = Math.max(0, Math.floor((now.getTime() - outTime) / 1000));
+        if (elapsedSec > UNDO_WINDOW_SECONDS) {
+          this.showToast('انتهت مهلة التراجع المسموحة (10 دقائق)!', 'warning');
+          return;
+        }
+
+        if (!confirm('هل تريد بالتأكيد التراجع عن تسجيل الانصراف والعودة لحالة الحضور؟')) return;
+
+        record.checkOutTime = null;
+        record.checkOutTimeFormatted = null;
+        record.checkOutTimeRaw = null;
+        record.workSeconds = 0;
+        record.status = 'حاضر';
+        record.undoneCheckOutAt = now.toISOString();
+        record.undoCount = (record.undoCount || 0) + 1;
+        record.updatedAt = now.toISOString();
+
+        try {
+          await window.cloudStore.saveAttendanceRecord(record);
+          this.showToast('تم التراجع عن تسجيل الانصراف بنجاح، يمكنك متابعة العمل أو الانصراف لاحقاً', 'success');
+        } catch (err) {
+          this.showToast('تم التراجع محلياً وسيتم المزامنة عند توفر الإنترنت', 'warning');
+        }
+      } else {
+        // Undo Check-in: delete the open check-in record within UNDO_WINDOW_SECONDS
+        const inTime = new Date(record.checkInTimeRaw || record.createdAt || record.date).getTime();
+        const elapsedSec = Math.max(0, Math.floor((now.getTime() - inTime) / 1000));
+        if (elapsedSec > UNDO_WINDOW_SECONDS) {
+          this.showToast('انتهت مهلة التراجع المسموحة (10 دقائق)!', 'warning');
+          return;
+        }
+
+        if (!confirm('هل تريد بالتأكيد التراجع عن تسجيل الحضور وحذف التسجيل؟')) return;
+
+        this.attendanceRecords = this.attendanceRecords.filter(r => r.id !== record.id);
+        localStorage.setItem('almustaqbal_attendance_records', JSON.stringify(this.attendanceRecords));
+
+        try {
+          await window.cloudStore.deleteAttendanceRecord(record.id);
+          this.showToast('تم التراجع عن تسجيل الحضور وحذف السجل بنجاح', 'success');
+        } catch (err) {
+          this.showToast('تم حذف السجل محلياً وسيتم المزامنة عند توفر الإنترنت', 'warning');
+        }
+      }
+    } finally {
+      this.scanBusy = false;
+      this.renderEmployeeView();
+      this.renderAdminView();
+    }
+  }
+
   async deleteRecord(recId) {
     if (!confirm('هل أنت متأكد من حذف هذا السجل نهائياً؟')) return;
     this.attendanceRecords = this.attendanceRecords.filter(r => r.id !== recId);
-    await window.cloudStore.deleteAttendanceRecord(recId);
-
-    this.showToast('تم حذف السجل بنجاح', 'info');
-    this.renderAttendanceTable();
-    this.renderAdminStats();
-    this.renderEmployeesGrid();
+    try {
+      await window.cloudStore.deleteAttendanceRecord(recId);
+      this.showToast('تم حذف السجل بنجاح', 'info');
+    } catch (err) {
+      this.showToast('تم حذف السجل محلياً وسيتم المزامنة عند توفر الإنترنت', 'warning');
+    } finally {
+      this.renderAttendanceTable();
+      this.renderAdminStats();
+      this.renderEmployeesGrid();
+    }
   }
 
   // Backup & JSON
@@ -1051,7 +1674,7 @@ class AttendanceApp {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `نسخة_احتياطية_مركز_المستقبل_${new Date().toISOString().slice(0, 10)}.json`;
+    a.download = `نسخة_احتياطية_مركز_المستقبل_${cairoDate()}.json`;
     a.click();
     URL.revokeObjectURL(url);
     this.showToast('تم تحميل ملف النسخة الاحتياطية بنجاح', 'success');
@@ -1065,17 +1688,92 @@ class AttendanceApp {
     reader.onload = (e) => {
       try {
         const parsed = JSON.parse(e.target.result);
-        if (parsed.employees && parsed.attendanceRecords) {
-          this.employees = parsed.employees;
-          this.attendanceRecords = parsed.attendanceRecords;
-          localStorage.setItem('almustaqbal_employees', JSON.stringify(this.employees));
-          localStorage.setItem('almustaqbal_attendance_records', JSON.stringify(this.attendanceRecords));
-          this.showToast('تمت استعادة البيانات بنجاح!', 'success');
-          this.renderEmployeeView();
-          this.renderAdminView();
-        } else {
+
+        // ── Schema validation ────────────────────────────────────────
+        if (!Array.isArray(parsed.employees) || !Array.isArray(parsed.attendanceRecords)) {
           throw new Error('Invalid schema');
         }
+        for (const r of parsed.attendanceRecords) {
+          if (!r.id || !r.empId || !r.date) throw new Error('Invalid record schema');
+        }
+
+        // ── Employees merge ──────────────────────────────────────────
+        // These fields must never be overwritten by an import
+        const EMP_PROTECTED = ['deviceToken', 'allowDirectButton'];
+
+        let empNew = 0, empUpdated = 0, empSkipped = 0;
+        const empById = Object.fromEntries(this.employees.map(e => [e.id, e]));
+
+        for (const incoming of parsed.employees) {
+          if (!incoming.id) { empSkipped++; continue; }
+          const existing = empById[incoming.id];
+          if (!existing) {
+            const safe = { ...incoming };
+            EMP_PROTECTED.forEach(k => { delete safe[k]; });
+            empById[incoming.id] = safe;
+            empNew++;
+          } else {
+            const inTs = incoming.updatedAt ? new Date(incoming.updatedAt).getTime() : 0;
+            const exTs = existing.updatedAt  ? new Date(existing.updatedAt).getTime()  : 0;
+            if (inTs > exTs) {
+              const safe = { ...incoming };
+              EMP_PROTECTED.forEach(k => { safe[k] = existing[k]; });
+              empById[incoming.id] = safe;
+              empUpdated++;
+            } else {
+              empSkipped++;
+            }
+          }
+        }
+        this.employees = Object.values(empById);
+
+        // ── Attendance records merge ─────────────────────────────────
+        const REC_PROTECTED = ['deviceToken'];
+        let recNew = 0, recUpdated = 0, recSkipped = 0;
+        const recById = Object.fromEntries(this.attendanceRecords.map(r => [r.id, r]));
+
+        for (const incoming of parsed.attendanceRecords) {
+          if (!incoming.id || !incoming.empId || !incoming.date) { recSkipped++; continue; }
+          const existing = recById[incoming.id];
+          if (!existing) {
+            recById[incoming.id] = { ...incoming };
+            recNew++;
+          } else {
+            const inTs = incoming.updatedAt ? new Date(incoming.updatedAt).getTime() : 0;
+            const exTs = existing.updatedAt  ? new Date(existing.updatedAt).getTime()  : 0;
+            if (inTs > exTs) {
+              const safe = { ...incoming };
+              REC_PROTECTED.forEach(k => { safe[k] = existing[k]; });
+              recById[incoming.id] = safe;
+              recUpdated++;
+            } else {
+              recSkipped++;
+            }
+          }
+        }
+        this.attendanceRecords = Object.values(recById);
+
+        // ── Persist locally ──────────────────────────────────────────
+        localStorage.setItem('almustaqbal_employees', JSON.stringify(this.employees));
+        localStorage.setItem('almustaqbal_attendance_records', JSON.stringify(this.attendanceRecords));
+
+        // Push to cloud (best-effort, non-blocking)
+        (async () => {
+          try {
+            await window.cloudStore.saveAllEmployees(this.employees);
+            await window.cloudStore.saveAllAttendanceRecords(this.attendanceRecords);
+          } catch (_) {
+            this.showToast('تم الحفظ محلياً وسيتم الرفع عند توفر الإنترنت', 'warning');
+          }
+        })();
+
+        const total = recNew + recUpdated + recSkipped;
+        this.showToast(
+          `الاستيراد مكتمل — ${recNew} جديد، ${recUpdated} محدَث، ${recSkipped} تجاهل (من ${total} سجل)`,
+          'success'
+        );
+        this.renderEmployeeView();
+        this.renderAdminView();
       } catch (err) {
         this.showToast('الملف غير صالح أو تالف', 'error');
       }
@@ -1092,6 +1790,22 @@ class AttendanceApp {
   closeModal(modalId) {
     const m = document.getElementById(modalId);
     if (m) m.classList.remove('active');
+
+    if (modalId === 'camera-scanner-modal' && this.html5QrCode) {
+      const scanner = this.html5QrCode;
+      this.html5QrCode = null;
+      try {
+        if (scanner.isScanning) {
+          scanner.stop().catch(() => {}).finally(() => {
+            try { scanner.clear(); } catch (e) {}
+          });
+        } else {
+          try { scanner.clear(); } catch (e) {}
+        }
+      } catch (e) {}
+      const scannerEl = document.getElementById('qr-camera-reader');
+      if (scannerEl) scannerEl.innerHTML = '';
+    }
   }
 
   showToast(message, type = 'info') {
@@ -1101,12 +1815,18 @@ class AttendanceApp {
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
 
-    let icon = 'fa-info-circle';
-    if (type === 'success') icon = 'fa-check-circle';
-    if (type === 'error') icon = 'fa-exclamation-triangle';
-    if (type === 'warning') icon = 'fa-bell';
+    let iconClass = 'fa-info-circle';
+    if (type === 'success') iconClass = 'fa-check-circle';
+    if (type === 'error') iconClass = 'fa-exclamation-triangle';
+    if (type === 'warning') iconClass = 'fa-bell';
 
-    toast.innerHTML = `<i class="fas ${icon}"></i> <span>${message}</span>`;
+    const iconEl = document.createElement('i');
+    iconEl.className = `fas ${iconClass}`;
+    const textEl = document.createElement('span');
+    textEl.textContent = message;
+
+    toast.appendChild(iconEl);
+    toast.appendChild(textEl);
     container.appendChild(toast);
 
     setTimeout(() => {
@@ -1131,6 +1851,82 @@ class AttendanceApp {
     const empFilter = document.getElementById('admin-emp-filter');
     if (empFilter) {
       empFilter.addEventListener('change', () => this.renderAttendanceTable());
+    }
+
+    this.registerServiceWorker();
+    this.setupPwaInstallPrompt();
+  }
+
+  // =========================================================================
+  // PWA & MOBILE INSTALLATION (تثبيت التطبيق على الهاتف)
+  // =========================================================================
+  registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+
+    window.addEventListener('load', () => {
+      navigator.serviceWorker.register('./sw.js').then(reg => {
+        console.log('✅ Service Worker registered:', reg.scope);
+
+        // Listen for an updated SW becoming available
+        reg.addEventListener('updatefound', () => {
+          const newWorker = reg.installing;
+          if (!newWorker) return;
+          newWorker.addEventListener('statechange', () => {
+            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+              // A new SW is waiting — the activate event will postMessage us
+            }
+          });
+        });
+      }).catch(err => {
+        console.warn('Service Worker registration failed:', err);
+      });
+
+      // Receive SW_UPDATED message from the newly activated service worker
+      navigator.serviceWorker.addEventListener('message', event => {
+        if (event.data && event.data.type === 'SW_UPDATED') {
+          this.showToast('تم تحديث التطبيق — يرجى إعادة تحميل الصفحة للحصول على آخر التحديثات 🔄', 'info');
+        }
+      });
+    });
+  }
+
+  setupPwaInstallPrompt() {
+    this.deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      this.deferredPrompt = e;
+      const installBtn = document.getElementById('btn-install-app');
+      if (installBtn) {
+        installBtn.style.display = 'inline-flex';
+      }
+    });
+
+    window.addEventListener('appinstalled', () => {
+      this.showToast('تم تثبيت تطبيق مركز المستقبل على هاتفك بنجاح! 🎉', 'success');
+      const installBtn = document.getElementById('btn-install-app');
+      if (installBtn) installBtn.style.display = 'none';
+    });
+  }
+
+  promptInstallApp() {
+    const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
+
+    if (isIOS) {
+      this.openModal('ios-install-modal');
+      return;
+    }
+
+    if (this.deferredPrompt) {
+      this.deferredPrompt.prompt();
+      this.deferredPrompt.userChoice.then((choiceResult) => {
+        if (choiceResult.outcome === 'accepted') {
+          this.showToast('جاري تثبيت التطبيق...', 'info');
+        }
+        this.deferredPrompt = null;
+      });
+    } else {
+      // If prompt already dismissed or in Chrome desktop/Android menu
+      this.showToast('يمكنك تثبيت التطبيق من قائمة خيارات المتصفح (⋮) ثم اختيار "تثبيت التطبيق" أو "إضافة للشاشة الرئيسية"', 'info');
     }
   }
 }
