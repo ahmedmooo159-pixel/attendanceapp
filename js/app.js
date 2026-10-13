@@ -42,7 +42,6 @@ function cairoDate(d = new Date()) {
 window.cairoDate = cairoDate;
 
 function cairoOffsetMs(d = new Date()) {
-  if (typeof window !== 'undefined' && window.cairoOffsetMs) return window.cairoOffsetMs(d);
   const dateObj = typeof d === 'string' || typeof d === 'number' ? new Date(d) : d;
   const dtf = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Africa/Cairo',
